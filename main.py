@@ -26,7 +26,7 @@ config = {}
 # ======================================================================================================================
 # DynamoDB
 # ======================================================================================================================
-def write_to_dynamo(ip_set_id, outstanding_requesters):
+def write_to_dynamo(outstanding_requesters):
     try:
         logging.getLogger().info("[write_to_dynamo] \twrite to dynamo table in region %s" % environ['REGION'])
         dynamodb = boto3.resource('dynamodb', region_name=environ['REGION'])
@@ -46,7 +46,6 @@ def write_to_dynamo(ip_set_id, outstanding_requesters):
 
         for k in unified_outstanding_requesters.keys():
             logging.getLogger().info("[update_waf_ip_set] \tBlock remaining outstanding requesters (%s)" % k)
-
             response = table.put_item(
                 Item={
                     'correlation_id': k,
@@ -56,8 +55,7 @@ def write_to_dynamo(ip_set_id, outstanding_requesters):
                 ConditionExpression='attribute_not_exists(correlation_id) AND attribute_not_exists(updated_at)'
             )
 
-
-        logging.getLogger().error("[write_to_dynamo] \t\twrite to dynamo succeeded")
+        logging.getLogger().info("[write_to_dynamo] \t\twrite to dynamo succeeded")
 
     except Exception as e:
         logging.getLogger().error("[write_to_dynamo] \terror write to dynamo")
@@ -147,15 +145,6 @@ def get_outstanding_requesters(bucket_name, key_name, log_type):
                             else:
                                 correlation_id_counter['general'][request_by_correlation_id_key] = 1
 
-                        if 'uriList' in config and uri in config['uriList'].keys():
-                            if uri not in correlation_id_counter['uriList'].keys():
-                                correlation_id_counter['uriList'][uri] = {}
-
-                            if request_key in correlation_id_counter['uriList'][uri].keys():
-                                correlation_id_counter['uriList'][uri][request_key] += 1
-                            else:
-                                correlation_id_counter['uriList'][uri][request_key] = 1
-
                 except Exception as e:
                     logging.getLogger().error("[get_outstanding_requesters] \t\tError to process line: %s" % line)
 
@@ -192,167 +181,6 @@ def get_outstanding_requesters(bucket_name, key_name, log_type):
     return correlation_id_outstanding_requesters
 
 
-def merge_outstanding_requesters(bucket_name, key_name, log_type, output_key_name, outstanding_requesters):
-    logging.getLogger().debug('[merge_outstanding_requesters] Start')
-
-    force_update = False
-    s3 = boto3.client('s3')
-
-    # --------------------------------------------------------------------------------------------------------------
-    logging.getLogger().info("[merge_outstanding_requesters] \tCalculate Last Update Age")
-    # --------------------------------------------------------------------------------------------------------------
-    response = None
-    try:
-        response = s3.head_object(Bucket=bucket_name, Key=output_key_name)
-    except Exception:
-        logging.getLogger().info('[merge_outstanding_requesters] No file to be merged.')
-        need_update = True
-        return outstanding_requesters, need_update
-
-    utc_last_modified = response['LastModified'].astimezone(datetime.timezone.utc)
-    utc_now_timestamp = datetime.datetime.now(datetime.timezone.utc)
-
-    utc_now_timestamp_str = utc_now_timestamp.strftime("%Y-%m-%d %H:%M:%S %Z%z")
-    last_update_age = int(((utc_now_timestamp - utc_last_modified).total_seconds()) / 60)
-
-    # --------------------------------------------------------------------------------------------------------------
-    logging.getLogger().info("[merge_outstanding_requesters] \tDownload current blocked IPs")
-    # --------------------------------------------------------------------------------------------------------------
-    local_file_path = '/tmp/' + key_name.split('/')[-1] + '_REMOTE.json'
-    s3.download_file(bucket_name, output_key_name, local_file_path)
-
-    # ----------------------------------------------------------------------------------------------------------
-    logging.getLogger().info("[merge_outstanding_requesters] \tProcess outstanding requesters files")
-    # ----------------------------------------------------------------------------------------------------------
-    remote_outstanding_requesters = {
-        'general': {},
-        'uriList': {}
-    }
-    with open(local_file_path, 'r') as file_content:
-        remote_outstanding_requesters = json.loads(file_content.read())
-
-    threshold = 'requestThreshold' if log_type == 'waf' else "errorThreshold"
-    try:
-        if 'general' in remote_outstanding_requesters:
-            for k, v in remote_outstanding_requesters['general'].items():
-                try:
-                    if k in outstanding_requesters['general'].keys():
-                        logging.getLogger().info(
-                            "[merge_outstanding_requesters] \t\tUpdating general data of BLOCK %s rule" % k)
-                        outstanding_requesters['general'][k]['updated_at'] = utc_now_timestamp_str
-                        if v['max_counter_per_min'] > outstanding_requesters['general'][k]['max_counter_per_min']:
-                            outstanding_requesters['general'][k]['max_counter_per_min'] = v['max_counter_per_min']
-
-                    else:
-                        utc_prev_updated_at = datetime.datetime.strptime(v['updated_at'],
-                                                                         "%Y-%m-%d %H:%M:%S %Z%z").astimezone(
-                            datetime.timezone.utc)
-                        total_diff_min = ((utc_now_timestamp - utc_prev_updated_at).total_seconds()) / 60
-
-                        if v['max_counter_per_min'] < config['general'][threshold]:
-                            force_update = True
-                            logging.getLogger().info(
-                                "[merge_outstanding_requesters] \t\t%s is bellow the current general threshold" % k)
-
-                        elif total_diff_min < config['general']['blockPeriod']:
-                            logging.getLogger().debug("[merge_outstanding_requesters] \t\tKeeping %s in general" % k)
-                            outstanding_requesters['general'][k] = v
-
-                        else:
-                            force_update = True
-                            logging.getLogger().info("[merge_outstanding_requesters] \t\t%s expired in general" % k)
-
-                except Exception:
-                    logging.getLogger().error("[merge_outstanding_requesters] \tError merging general %s rule" % k)
-    except Exception:
-        logging.getLogger().error('[merge_outstanding_requesters] Failed to process general group.')
-
-    try:
-        if 'uriList' in remote_outstanding_requesters:
-            if 'uriList' not in config or len(config['uriList']) == 0:
-                force_update = True
-                logging.getLogger().info(
-                    "[merge_outstanding_requesters] \t\tCurrent config file does not contain uriList anymore")
-            else:
-                for uri in remote_outstanding_requesters['uriList'].keys():
-                    if 'ignoredSufixes' in config['general'] and uri.endswith(
-                            tuple(config['general']['ignoredSufixes'])):
-                        force_update = True
-                        logging.getLogger().info(
-                            "[merge_outstanding_requesters] \t\t%s is in current ignored sufixes list." % uri)
-                        continue
-
-                    for k, v in remote_outstanding_requesters['uriList'][uri].items():
-                        try:
-                            if uri in outstanding_requesters['uriList'].keys() and k in \
-                                    outstanding_requesters['uriList'][uri].keys():
-                                logging.getLogger().info(
-                                    "[merge_outstanding_requesters] \t\tUpdating uriList (%s) data of BLOCK %s rule" % (
-                                    uri, k))
-                                outstanding_requesters['uriList'][uri][k]['updated_at'] = utc_now_timestamp_str
-                                if v['max_counter_per_min'] > outstanding_requesters['uriList'][uri][k][
-                                    'max_counter_per_min']:
-                                    outstanding_requesters['uriList'][uri][k]['max_counter_per_min'] = v[
-                                        'max_counter_per_min']
-
-                            else:
-                                utc_prev_updated_at = datetime.datetime.strptime(v['updated_at'],
-                                                                                 "%Y-%m-%d %H:%M:%S %Z%z").astimezone(
-                                    datetime.timezone.utc)
-                                total_diff_min = ((utc_now_timestamp - utc_prev_updated_at).total_seconds()) / 60
-
-                                if v['max_counter_per_min'] < config['uriList'][uri][threshold]:
-                                    force_update = True
-                                    logging.getLogger().info(
-                                        "[merge_outstanding_requesters] \t\t%s is bellow the current uriList (%s) "
-                                        "threshold" % (k, uri))
-
-                                elif total_diff_min < config['general']['blockPeriod']:
-                                    logging.getLogger().debug(
-                                        "[merge_outstanding_requesters] \t\tKeeping %s in uriList (%s)" % (k, uri))
-
-                                    if uri not in outstanding_requesters['uriList'].keys():
-                                        outstanding_requesters['uriList'][uri] = {}
-
-                                    outstanding_requesters['uriList'][uri][k] = v
-                                else:
-                                    force_update = True
-                                    logging.getLogger().info(
-                                        "[merge_outstanding_requesters] \t\t%s expired in uriList (%s)" % (k, uri))
-
-                        except Exception:
-                            logging.getLogger().error(
-                                "[merge_outstanding_requesters] \tError merging uriList (%s) %s rule" % (uri, k))
-    except Exception:
-        logging.getLogger().error('[merge_outstanding_requesters] Failed to process uriList group.')
-
-    need_update = (force_update or
-                   last_update_age > int(environ['MAX_AGE_TO_UPDATE']) or
-                   len(outstanding_requesters['general']) > 0 or
-                   len(outstanding_requesters['uriList']) > 0)
-
-    logging.getLogger().debug('[merge_outstanding_requesters] End')
-    return outstanding_requesters, need_update
-
-
-def write_output(bucket_name, key_name, output_key_name, outstanding_requesters):
-    logging.getLogger().debug('[write_output] Start')
-
-    try:
-        current_data = '/tmp/' + key_name.split('/')[-1] + '_LOCAL.json'
-        with open(current_data, 'w') as outfile:
-            json.dump(outstanding_requesters, outfile)
-
-        s3 = boto3.client('s3')
-        s3.upload_file(current_data, bucket_name, output_key_name, ExtraArgs={'ContentType': "application/json"})
-
-    except Exception as e:
-        logging.getLogger().error("[write_output] \tError to write output file")
-        logging.getLogger().error(e)
-
-    logging.getLogger().debug('[write_output] End')
-
-
 def process_log_file(bucket_name, key_name, conf_filename, output_filename, log_type, ip_set_id):
     logging.getLogger().debug('[process_log_file] Start')
 
@@ -365,20 +193,12 @@ def process_log_file(bucket_name, key_name, conf_filename, output_filename, log_
     # --------------------------------------------------------------------------------------------------------------
     logging.getLogger().info("[process_log_file] \t outstanding requester before merge %s", outstanding_requesters)
     # --------------------------------------------------------------------------------------------------------------
-
-    outstanding_requesters, need_update = merge_outstanding_requesters(bucket_name, key_name, log_type, output_filename,
-                                                                       outstanding_requesters)
-
-    # --------------------------------------------------------------------------------------------------------------
-    logging.getLogger().info("[process_log_file] \t outstanding requester after merge %s", outstanding_requesters)
-    # --------------------------------------------------------------------------------------------------------------
-
+    need_update = len(outstanding_requesters['general']) > 0
     if need_update:
         # ----------------------------------------------------------------------------------------------------------
         logging.getLogger().info("[process_log_file] \tUpdate new blocked requesters list to %s", outstanding_requesters)
         # ----------------------------------------------------------------------------------------------------------
-        write_output(bucket_name, key_name, output_filename, outstanding_requesters)
-        write_to_dynamo(ip_set_id, outstanding_requesters)
+        write_to_dynamo(outstanding_requesters)
     else:
         # ----------------------------------------------------------------------------------------------------------
         logging.getLogger().info("[process_log_file] \tNo changes identified")
