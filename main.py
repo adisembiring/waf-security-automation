@@ -48,14 +48,16 @@ def write_to_dynamo(ip_set_id, outstanding_requesters):
             logging.getLogger().info("[update_waf_ip_set] \tBlock remaining outstanding requesters (%s)" % k)
 
             response = table.put_item(
-                Item = {
+                Item={
                     'correlation_id': k,
                     'updated_at': unified_outstanding_requesters[k]['updated_at'],
                     'max_counter_per_min': unified_outstanding_requesters[k]['max_counter_per_min'],
-                }
+                },
+                ConditionExpression='attribute_not_exists(correlation_id) AND attribute_not_exists(updated_at)'
             )
-            print("PutItem succeeded:")
-            print(json.dumps(response))
+
+
+        logging.getLogger().error("[write_to_dynamo] \t\twrite to dynamo succeeded")
 
     except Exception as e:
         logging.getLogger().error("[write_to_dynamo] \terror write to dynamo")
