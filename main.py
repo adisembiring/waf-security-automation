@@ -18,79 +18,22 @@ logging.getLogger().debug('Loading function')
 # Constants/Globals
 # ======================================================================================================================
 API_CALL_NUM_RETRIES = 5
-MAX_DESCRIPTORS_PER_IP_SET_UPDATE = 500
-DELAY_BETWEEN_UPDATES = 2
-
-# CloudFront Access Logs
-# http://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/AccessLogs.html#BasicDistributionFileFormat
-LINE_FORMAT_CLOUD_FRONT = {
-    'delimiter': '\t',
-    'date': 0,
-    'time': 1,
-    'source_ip': 4,
-    'uri': 7,
-    'code': 8
-}
-# ALB Access Logs
-# http://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html
-LINE_FORMAT_ALB = {
-    'delimiter': ' ',
-    'timestamp': 1,
-    'source_ip': 3,
-    'code': 9,  # GitHub issue #44. Changed from elb_status_code to target_status_code.
-    'uri': 13
-}
 
 waf = None
 config = {}
 
 
 # ======================================================================================================================
-# Auxiliary Functions
+# DynamoDB
 # ======================================================================================================================
-def waf_get_ip_set(ip_set_id):
-    logging.getLogger().debug('[waf_get_ip_set] Start')
-    response = waf.get_ip_set(IPSetId=ip_set_id)
-    logging.getLogger().debug('[waf_get_ip_set] End')
-    return response
-
-
-def waf_commit_updates(ip_set_id, updates_list):
-    logging.getLogger().debug('[waf_commit_updates] Start')
-    response = None
-
-    if len(updates_list) > 0:
-        index = 0
-        while index < len(updates_list):
-            logging.getLogger().debug('[waf_commit_updates] Processing from index %d.' % index)
-
-            response = waf.update_ip_set(IPSetId=ip_set_id,
-                                         ChangeToken=waf.get_change_token()['ChangeToken'],
-                                         Updates=updates_list[index: index + MAX_DESCRIPTORS_PER_IP_SET_UPDATE])
-
-            index += MAX_DESCRIPTORS_PER_IP_SET_UPDATE
-            if index < len(updates_list):
-                logging.getLogger().debug(
-                    '[waf_commit_updates] Sleep %d sec befone next slot to avoid AWS WAF API throttling ...' % DELAY_BETWEEN_UPDATES)
-                time.sleep(DELAY_BETWEEN_UPDATES)
-
-    logging.getLogger().debug('[waf_commit_updates] End')
-    return response
-
-
-def update_waf_ip_set(ip_set_id, outstanding_requesters):
-    logging.getLogger().info('[update_waf_ip_set] Start')
-
-    counter = 0
+def write_to_dynamo(ip_set_id, outstanding_requesters):
     try:
-        if ip_set_id is None:
-            logging.getLogger().info("[update_waf_ip_set] Ignore process when ip_set_id is None")
-            return
-
-        updates_list = []
+        logging.getLogger().info("[write_to_dynamo] \twrite to dynamo table in region %s" % environ['REGION'])
+        dynamodb = boto3.resource('dynamodb', region_name=environ['REGION'])
+        table = dynamodb.Table('abused_correlation_ids')
 
         # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().info("[update_waf_ip_set] \tMerge general and uriList into a single list")
+        logging.getLogger().info("[write_to_dynamo] \tMerge general and uriList into a single list")
         # --------------------------------------------------------------------------------------------------------------
         unified_outstanding_requesters = outstanding_requesters['general']
         for uri in outstanding_requesters['uriList'].keys():
@@ -99,234 +42,23 @@ def update_waf_ip_set(ip_set_id, outstanding_requesters):
                         outstanding_requesters['uriList'][uri][k]['max_counter_per_min'] >
                         unified_outstanding_requesters[k]['max_counter_per_min']):
                     unified_outstanding_requesters[k] = outstanding_requesters['uriList'][uri][k]
+        logging.getLogger().info("[process_log_file] \tUpdate correlation_id set %s", unified_outstanding_requesters)
 
-        # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().info("[update_waf_ip_set] \tTruncate [if necessary] list to respect WAF limit")
-        # --------------------------------------------------------------------------------------------------------------
-        if len(unified_outstanding_requesters) > int(environ['LIMIT_IP_ADDRESS_RANGES_PER_IP_MATCH_CONDITION']):
-            ordered_unified_outstanding_requesters = sorted(unified_outstanding_requesters.items(),
-                                                            key=lambda kv: kv[1]['max_counter_per_min'], reverse=True)
-            unified_outstanding_requesters = {}
-            for key, value in ordered_unified_outstanding_requesters:
-                logging.getLogger().debug(
-                    "[update_waf_ip_set] \tTruncate [if necessary] list to respect WAF limit (%s)" % (key))
-                if counter < int(environ['LIMIT_IP_ADDRESS_RANGES_PER_IP_MATCH_CONDITION']):
-                    unified_outstanding_requesters[key] = value
-                    counter += 1
-                else:
-                    break
-
-        # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().info("[update_waf_ip_set] \tRemove IPs that are not in current outstanding requesters list")
-        # --------------------------------------------------------------------------------------------------------------
-        response = waf_get_ip_set(ip_set_id)
-        if response is not None:
-            for k in response['IPSet']['IPSetDescriptors']:
-                logging.getLogger().debug("[update_waf_ip_set] \tRemove IPs that are not in current outstanding "
-                                          "requesters list (%s)" % (k))
-                ip_value = k['Value'].split('/')[0]
-                if ip_value not in unified_outstanding_requesters.keys():
-                    ip_type = "IPV%s" % ip_address(ip_value).version
-                    updates_list.append({
-                        'Action': 'DELETE',
-                        'IPSetDescriptor': {
-                            'Type': ip_type,
-                            'Value': k['Value']
-                        }
-                    })
-                else:
-                    # Dont block an already blocked IP
-                    unified_outstanding_requesters.pop(ip_value, None)
-
-        # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().info("[update_waf_ip_set] \tBlock remaining outstanding requesters")
-        # --------------------------------------------------------------------------------------------------------------
         for k in unified_outstanding_requesters.keys():
-            logging.getLogger().debug("[update_waf_ip_set] \tBlock remaining outstanding requesters (%s)" % (k))
-            ip_type = "IPV%s" % ip_address(k).version
-            ip_class = "32" if ip_type == "IPV4" else "128"
-            updates_list.append({
-                'Action': 'INSERT',
-                'IPSetDescriptor': {
-                    'Type': ip_type,
-                    'Value': "%s/%s" % (k, ip_class)
+            logging.getLogger().info("[update_waf_ip_set] \tBlock remaining outstanding requesters (%s)" % k)
+
+            response = table.put_item(
+                Item = {
+                    'correlation_id': k,
+                    'updated_at': unified_outstanding_requesters[k]['updated_at'],
+                    'max_counter_per_min': unified_outstanding_requesters[k]['max_counter_per_min'],
                 }
-            })
-
-        # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().info("[update_waf_ip_set] \tCommit changes in WAF IP set")
-        # --------------------------------------------------------------------------------------------------------------
-        response = waf_commit_updates(ip_set_id, updates_list)
-
-    except Exception as error:
-        logging.getLogger().error(str(error))
-        logging.getLogger().error("[update_waf_ip_set] Error to update waf ip set")
-
-    logging.getLogger().debug('[update_waf_ip_set] End')
-    return counter
-
-
-def send_anonymous_usage_data():
-    try:
-        if 'SEND_ANONYMOUS_USAGE_DATA' not in environ or environ['SEND_ANONYMOUS_USAGE_DATA'].lower() != 'yes':
-            return
-
-        logging.getLogger().debug("[send_anonymous_usage_data] Start")
-
-        cw = boto3.client('cloudwatch')
-        usage_data = {
-            "Solution": "SO0006",
-            "UUID": environ['UUID'],
-            "TimeStamp": str(datetime.datetime.utcnow().isoformat()),
-            "Data":
-                {
-                    "data_type": "lop_parser",
-                    "scanners_probes_set_size": 0,
-                    "http_flood_set_size": 0,
-                    "allowed_requests": 0,
-                    "blocked_requests_all": 0,
-                    "blocked_requests_scanners_probes": 0,
-                    "blocked_requests_http_flood": 0,
-                    "waf_type": environ['LOG_TYPE']
-                }
-        }
-
-        # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().debug("[send_anonymous_usage_data] Get num allowed requests")
-        # --------------------------------------------------------------------------------------------------------------
-        try:
-            response = cw.get_metric_statistics(
-                MetricName='AllowedRequests',
-                Namespace='WAF',
-                Statistics=['Sum'],
-                Period=12 * 3600,
-                StartTime=datetime.datetime.utcnow() - datetime.timedelta(seconds=12 * 3600),
-                EndTime=datetime.datetime.utcnow(),
-                Dimensions=[
-                    {
-                        "Name": "Rule",
-                        "Value": "ALL"
-                    },
-                    {
-                        "Name": "WebACL",
-                        "Value": environ['METRIC_NAME_PREFIX'] + 'MaliciousRequesters'
-                    }
-                ]
             )
-            usage_data['Data']['allowed_requests'] = response['Datapoints'][0]['Sum']
+            print("PutItem succeeded:")
+            print(json.dumps(response))
 
-        except Exception as error:
-            logging.getLogger().debug("[send_anonymous_usage_data] Failed to get Num Allowed Requests")
-            logging.getLogger().debug(str(error))
-
-        # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().info("[send_anonymous_usage_data] Get num blocked requests - all rules")
-        # --------------------------------------------------------------------------------------------------------------
-        try:
-            response = cw.get_metric_statistics(
-                MetricName='BlockedRequests',
-                Namespace='WAF',
-                Statistics=['Sum'],
-                Period=12 * 3600,
-                StartTime=datetime.datetime.utcnow() - datetime.timedelta(seconds=12 * 3600),
-                EndTime=datetime.datetime.utcnow(),
-                Dimensions=[
-                    {
-                        "Name": "Rule",
-                        "Value": "ALL"
-                    },
-                    {
-                        "Name": "WebACL",
-                        "Value": environ['METRIC_NAME_PREFIX'] + 'MaliciousRequesters'
-                    }
-                ]
-            )
-            usage_data['Data']['blocked_requests_all'] = response['Datapoints'][0]['Sum']
-
-        except Exception as error:
-            logging.getLogger().debug("[send_anonymous_usage_data] Failed to get num blocked requests - all rules")
-            logging.getLogger().debug(str(error))
-
-        # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().debug("[send_anonymous_usage_data] Get scanners probes data")
-        # --------------------------------------------------------------------------------------------------------------
-        if 'IP_SET_ID_SCANNERS_PROBES' in environ:
-            try:
-                response = waf_get_ip_set(environ['IP_SET_ID_SCANNERS_PROBES'])
-                if response != None:
-                    usage_data['Data']['scanners_probes_set_size'] = len(response['IPSet']['IPSetDescriptors'])
-
-                response = cw.get_metric_statistics(
-                    MetricName='BlockedRequests',
-                    Namespace='WAF',
-                    Statistics=['Sum'],
-                    Period=12 * 3600,
-                    StartTime=datetime.datetime.utcnow() - datetime.timedelta(seconds=12 * 3600),
-                    EndTime=datetime.datetime.utcnow(),
-                    Dimensions=[
-                        {
-                            "Name": "Rule",
-                            "Value": environ['METRIC_NAME_PREFIX'] + 'ScannersProbesRule'
-                        },
-                        {
-                            "Name": "WebACL",
-                            "Value": environ['METRIC_NAME_PREFIX'] + 'MaliciousRequesters'
-                        }
-                    ]
-                )
-                usage_data['Data']['blocked_requests_scanners_probes'] = response['Datapoints'][0]['Sum']
-
-            except Exception as error:
-                logging.getLogger().debug("[send_anonymous_usage_data] Failed to get scanners probes data")
-                logging.getLogger().debug(str(error))
-
-        # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().debug("[send_anonymous_usage_data] Get HTTP flood data")
-        # --------------------------------------------------------------------------------------------------------------
-        if 'IP_SET_ID_HTTP_FLOOD' in environ:
-            try:
-                response = waf_get_ip_set(environ['IP_SET_ID_HTTP_FLOOD'])
-                if response != None:
-                    usage_data['Data']['http_flood_set_size'] = len(response['IPSet']['IPSetDescriptors'])
-
-                response = cw.get_metric_statistics(
-                    MetricName='BlockedRequests',
-                    Namespace='WAF',
-                    Statistics=['Sum'],
-                    Period=12 * 3600,
-                    StartTime=datetime.datetime.utcnow() - datetime.timedelta(seconds=12 * 3600),
-                    EndTime=datetime.datetime.utcnow(),
-                    Dimensions=[
-                        {
-                            "Name": "Rule",
-                            "Value": environ['METRIC_NAME_PREFIX'] + 'HttpFloodRule'
-                        },
-                        {
-                            "Name": "WebACL",
-                            "Value": environ['METRIC_NAME_PREFIX'] + 'MaliciousRequesters'
-                        }
-                    ]
-                )
-                usage_data['Data']['blocked_requests_http_flood'] = response['Datapoints'][0]['Sum']
-
-            except Exception as error:
-                logging.getLogger().debug("[send_anonymous_usage_data] Failed to get HTTP flood data")
-                logging.getLogger().debug(str(error))
-
-        # --------------------------------------------------------------------------------------------------------------
-        logging.getLogger().info("[send_anonymous_usage_data] Send Data ABCD")
-        # --------------------------------------------------------------------------------------------------------------
-        url = 'https://metrics.awssolutionsbuilder.com/generic'
-        req = Request(url, method='POST', data=bytes(json.dumps(usage_data), encoding='utf8'),
-                      headers={'Content-Type': 'application/json'})
-        rsp = urlopen(req)
-        rspcode = rsp.getcode()
-        logging.getLogger().debug('[send_anonymous_usage_data] Response Code: {}'.format(rspcode))
-        logging.getLogger().debug("[send_anonymous_usage_data] End")
-
-    except Exception as error:
-        logging.getLogger().debug("[send_anonymous_usage_data] Failed to send data")
-        logging.getLogger().debug(str(error))
+    except Exception as e:
+        logging.getLogger().error("[write_to_dynamo] \terror write to dynamo")
 
 
 # ======================================================================================================================
@@ -353,11 +85,12 @@ def load_configurations(bucket_name, key_name):
 def get_outstanding_requesters(bucket_name, key_name, log_type):
     logging.getLogger().debug('[get_outstanding_requesters] Start')
 
-    counter = {
+    correlation_id_counter = {
         'general': {},
         'uriList': {}
     }
-    outstanding_requesters = {
+
+    correlation_id_outstanding_requesters = {
         'general': {},
         'uriList': {}
     }
@@ -377,6 +110,7 @@ def get_outstanding_requesters(bucket_name, key_name, log_type):
             for line in content:
                 try:
                     request_key = ""
+                    request_by_correlation_id_key = ""
                     uri = ""
                     return_code_index = None
 
@@ -384,15 +118,19 @@ def get_outstanding_requesters(bucket_name, key_name, log_type):
                         line = line.decode()  # Remove the b in front of each field
                         line_data = json.loads(str(line))
 
-                        request_key = datetime.datetime.fromtimestamp(int(line_data['timestamp']) / 1000.0).isoformat(
+                        request_by_correlation_id_key = datetime.datetime.fromtimestamp(int(line_data['timestamp']) / 1000.0).isoformat(
                             sep='T', timespec='minutes')
-                        request_key += ' ' + line_data['httpRequest']['clientIp']
-                        uri = urlparse(line_data['httpRequest']['uri']).path
 
-                        # logging.getLogger().info("[get_outstanding_requesters] \t\Fetch line: %s"%request_key)
+                        uri = urlparse(line_data['httpRequest']['uri']).path
+                        header_list = line_data['httpRequest']['headers']
+                        for x in header_list:
+                            if x['name'] == 'x-i2g-correlation-id':
+                                request_by_correlation_id_key += ' ' + x['value']
+                                logging.getLogger().info("[get_outstanding_requesters] \t\t item correlation_id: %s %s" % (x['value'], request_by_correlation_id_key))
+                                break
 
                     else:
-                        return outstanding_requesters
+                        return correlation_id_counter
 
                     if 'ignoredSufixes' in config['general'] and uri.endswith(
                             tuple(config['general']['ignoredSufixes'])):
@@ -401,19 +139,20 @@ def get_outstanding_requesters(bucket_name, key_name, log_type):
                         continue
 
                     if return_code_index == None or line_data[return_code_index] in config['general']['errorCodes']:
-                        if request_key in counter['general'].keys():
-                            counter['general'][request_key] += 1
-                        else:
-                            counter['general'][request_key] = 1
+                        if request_by_correlation_id_key is not None:
+                            if request_by_correlation_id_key in correlation_id_counter['general'].keys():
+                                correlation_id_counter['general'][request_by_correlation_id_key] += 1
+                            else:
+                                correlation_id_counter['general'][request_by_correlation_id_key] = 1
 
                         if 'uriList' in config and uri in config['uriList'].keys():
-                            if uri not in counter['uriList'].keys():
-                                counter['uriList'][uri] = {}
+                            if uri not in correlation_id_counter['uriList'].keys():
+                                correlation_id_counter['uriList'][uri] = {}
 
-                            if request_key in counter['uriList'][uri].keys():
-                                counter['uriList'][uri][request_key] += 1
+                            if request_key in correlation_id_counter['uriList'][uri].keys():
+                                correlation_id_counter['uriList'][uri][request_key] += 1
                             else:
-                                counter['uriList'][uri][request_key] = 1
+                                correlation_id_counter['uriList'][uri][request_key] = 1
 
                 except Exception as e:
                     logging.getLogger().error("[get_outstanding_requesters] \t\tError to process line: %s" % line)
@@ -423,19 +162,19 @@ def get_outstanding_requesters(bucket_name, key_name, log_type):
         # --------------------------------------------------------------------------------------------------------------
         threshold = 'requestThreshold' if log_type == 'waf' else "errorThreshold"
         utc_now_timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z%z")
-        for k, num_reqs in counter['general'].items():
+        for k, num_reqs in correlation_id_counter['general'].items():
             try:
                 k = k.split(' ')[-1]
                 logging.getLogger().info("[get_outstanding_requesters] \t\tgeneral (%s) %s %s" % (uri, k, num_reqs))
-                if num_reqs >= config['general'][threshold]:
+                if num_reqs >= 5:
                     logging.getLogger().info(
                         "[get_outstanding_requesters] \t\tfound more than threshold (%s) %s %s" % (uri, k, num_reqs))
-                    if k not in outstanding_requesters['general'].keys() or num_reqs > \
-                            outstanding_requesters['general'][k]['max_counter_per_min']:
+                    if k not in correlation_id_outstanding_requesters['general'].keys() or num_reqs > \
+                            correlation_id_outstanding_requesters['general'][k]['max_counter_per_min']:
                         logging.getLogger().info(
                             "[get_outstanding_requesters] \t\t send to outsanding requester (%s) %s %s" % (
-                            uri, k, num_reqs))
-                        outstanding_requesters['general'][k] = {
+                                uri, k, num_reqs))
+                        correlation_id_outstanding_requesters['general'][k] = {
                             'max_counter_per_min': num_reqs,
                             'updated_at': utc_now_timestamp_str
                         }
@@ -443,31 +182,12 @@ def get_outstanding_requesters(bucket_name, key_name, log_type):
                 logging.getLogger().error(
                     "[get_outstanding_requesters] \t\tError to process outstanding requester: %s" % k)
 
-        for uri in counter['uriList'].keys():
-            for k, num_reqs in counter['uriList'][uri].items():
-                try:
-                    logging.getLogger().info("[get_outstanding_requesters] \t Iterate list")
-                    k = k.split(' ')[-1]
-                    if num_reqs >= config['uriList'][uri][threshold]:
-                        if uri not in outstanding_requesters['uriList'].keys():
-                            outstanding_requesters['uriList'][uri] = {}
-
-                        if k not in outstanding_requesters['uriList'][uri].keys() or num_reqs > \
-                                outstanding_requesters['uriList'][uri][k]['max_counter_per_min']:
-                            outstanding_requesters['uriList'][uri][k] = {
-                                'max_counter_per_min': num_reqs,
-                                'updated_at': utc_now_timestamp_str
-                            }
-                except Exception as e:
-                    logging.getLogger().error(
-                        "[get_outstanding_requesters] \t\tError to process outstanding requester: (%s) %s" % (uri, k))
-
     except Exception as e:
         logging.getLogger().error("[get_outstanding_requesters] \tError to read input file")
         logging.getLogger().error(e)
 
     logging.getLogger().debug('[get_outstanding_requesters] End')
-    return outstanding_requesters
+    return correlation_id_outstanding_requesters
 
 
 def merge_outstanding_requesters(bucket_name, key_name, log_type, output_key_name, outstanding_requesters):
@@ -647,18 +367,16 @@ def process_log_file(bucket_name, key_name, conf_filename, output_filename, log_
     outstanding_requesters, need_update = merge_outstanding_requesters(bucket_name, key_name, log_type, output_filename,
                                                                        outstanding_requesters)
 
+    # --------------------------------------------------------------------------------------------------------------
+    logging.getLogger().info("[process_log_file] \t outstanding requester after merge %s", outstanding_requesters)
+    # --------------------------------------------------------------------------------------------------------------
+
     if need_update:
         # ----------------------------------------------------------------------------------------------------------
-        logging.getLogger().info("[process_log_file] \tUpdate new blocked requesters list to S3")
+        logging.getLogger().info("[process_log_file] \tUpdate new blocked requesters list to %s", outstanding_requesters)
         # ----------------------------------------------------------------------------------------------------------
         write_output(bucket_name, key_name, output_filename, outstanding_requesters)
-
-        # ----------------------------------------------------------------------------------------------------------
-        logging.getLogger().info("[process_log_file] \tUpdate WAF IP Set ???? %s", outstanding_requesters)
-        # ----------------------------------------------------------------------------------------------------------
-        update_waf_ip_set(ip_set_id, outstanding_requesters)
-
-
+        write_to_dynamo(ip_set_id, outstanding_requesters)
     else:
         # ----------------------------------------------------------------------------------------------------------
         logging.getLogger().info("[process_log_file] \tNo changes identified")
@@ -689,15 +407,17 @@ def lambda_handler(event, context):
         # ------------------------------------------------------------------
         global waf
         if environ['LOG_TYPE'] == 'alb':
+
             session = boto3.session.Session(region_name=environ['REGION'])
             waf = session.client('waf-regional', config=Config(retries={'max_attempts': API_CALL_NUM_RETRIES}))
         else:
+            print('waf log type')
             waf = boto3.client('waf', config=Config(retries={'max_attempts': API_CALL_NUM_RETRIES}))
 
         # ----------------------------------------------------------
         # Process event
         # ----------------------------------------------------------
-        logging.getLogger().info(event)
+        logging.getLogger().info('[main] received event', event)
         if 'Records' in event:
             for r in event['Records']:
                 bucket_name = r['s3']['bucket']['name']
@@ -715,8 +435,6 @@ def lambda_handler(event, context):
                 else:
                     result['message'] = "[lambda_handler] undefined handler for bucket %s" % bucket_name
                     logging.getLogger().info(result['message'])
-
-                send_anonymous_usage_data()
 
         else:
             result['message'] = "[lambda_handler] undefined handler for this type of event"
